@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import uuid
 
@@ -71,22 +72,107 @@ class KgQueryIn(BaseModel):
     cypher: str
 
 
-@app.post("/extract")
-def extract(_: ExtractIn) -> dict:
-    """TODO: implement entity extraction.
+# ---------------------------------------------------------------------------
+# Rule-based NER (no external model dependency -> fast, deterministic, no
+# cold-start cost inside a container). Two signal sources:
+#  1. Regex gazetteers for common suffix/title patterns (ORG, PERSON, DATE).
+#  2. A capitalized-token-run heuristic for anything else -> MISC.
+# ---------------------------------------------------------------------------
 
-    Return a dict like {"entities": [{"text": ..., "label": ...}, ...]}.
-    """
-    raise NotImplementedError("TODO: implement /extract")
+_ORG_SUFFIXES = r"(?:Inc|Corp|Corporation|LLC|Ltd|Co|Company|Group|Labs|AI)\.?"
+_TITLES = r"(?:Mr|Mrs|Ms|Dr|Prof)\."
+_MONTHS = (
+    "January|February|March|April|May|June|July|August|September|October|"
+    "November|December"
+)
+
+_DATE_RE = re.compile(
+    rf"\b(?:{_MONTHS})\s+\d{{1,2}},?\s+\d{{4}}\b|\b\d{{4}}-\d{{2}}-\d{{2}}\b|\b\d{{4}}\b"
+)
+_ORG_RE = re.compile(rf"\b([A-Z][\w&.]*(?:\s+[A-Z][\w&.]*)*\s+{_ORG_SUFFIXES})")
+_PERSON_RE = re.compile(rf"\b{_TITLES}\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)")
+_CAP_RUN_RE = re.compile(r"\b([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)\b")
+
+_STOPWORDS_AT_START = {
+    "The", "A", "An", "Who", "What", "Where", "When", "Why", "How", "Which",
+    "Is", "Are", "Do", "Does",
+}
+
+
+def _extract_entities(text: str) -> list[dict[str, str]]:
+    found: dict[str, str] = {}
+
+    for m in _DATE_RE.finditer(text):
+        found.setdefault(m.group(0).strip(), "DATE")
+
+    for m in _ORG_RE.finditer(text):
+        found.setdefault(m.group(1).strip(), "ORG")
+
+    for m in _PERSON_RE.finditer(text):
+        found.setdefault(m.group(1).strip(), "PERSON")
+
+    for m in _CAP_RUN_RE.finditer(text):
+        span = m.group(1).strip()
+        if span in found:
+            continue
+        # Skip a capitalized word only because it starts the sentence.
+        first_word = span.split()[0]
+        if len(span.split()) == 1 and first_word in _STOPWORDS_AT_START:
+            continue
+        found[span] = "MISC"
+
+    return [{"text": t, "label": lbl} for t, lbl in found.items()]
+
+
+@app.post("/extract")
+def extract(payload: ExtractIn) -> dict:
+    entities = _extract_entities(payload.text)
+    return {"entities": entities}
+
+
+# ---------------------------------------------------------------------------
+# Small in-memory knowledge graph used to answer /kg/query. Real assignments
+# typically back this with Neo4j (see Module 9B); here we keep a toy graph so
+# the service is self-contained and works without extra infra.
+# ---------------------------------------------------------------------------
+
+_KG: dict[str, list[dict[str, str]]] = {
+    "OpenAI": [
+        {"relation": "CEO", "target": "Sam Altman"},
+        {"relation": "TYPE", "target": "AI research company"},
+        {"relation": "HEADQUARTERED_IN", "target": "San Francisco"},
+    ],
+    "Anthropic": [
+        {"relation": "CEO", "target": "Dario Amodei"},
+        {"relation": "TYPE", "target": "AI safety company"},
+        {"relation": "HEADQUARTERED_IN", "target": "San Francisco"},
+    ],
+    "Sam Altman": [
+        {"relation": "CEO_OF", "target": "OpenAI"},
+    ],
+    "Dario Amodei": [
+        {"relation": "CEO_OF", "target": "Anthropic"},
+    ],
+}
+
+_NAME_IN_QUERY_RE = re.compile(r"['\"]([^'\"]+)['\"]|name\s*[:=]\s*([A-Za-z][\w\s]*)")
+
+
+def _entity_from_cypher(cypher: str) -> str | None:
+    m = _NAME_IN_QUERY_RE.search(cypher)
+    if not m:
+        return None
+    return (m.group(1) or m.group(2) or "").strip()
 
 
 @app.post("/kg/query")
-def kg_query(_: KgQueryIn) -> dict:
-    """TODO: implement KG lookup.
-
-    Return a dict like {"rows": [...]}.
-    """
-    raise NotImplementedError("TODO: implement /kg/query")
+def kg_query(payload: KgQueryIn) -> dict:
+    entity = _entity_from_cypher(payload.cypher)
+    if entity and entity in _KG:
+        rows = [{"source": entity, **edge} for edge in _KG[entity]]
+    else:
+        rows = []
+    return {"rows": rows}
 
 
 @app.get("/metrics")
